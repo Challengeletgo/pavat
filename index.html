@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>파밭 직거래 - 대파 산지 직거래 플랫폼</title>
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+    <!-- FontAwesome Icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    
+    <!-- 네이버 Maps API -->
+    <script type="text/javascript" src="https://oapi.map.naver.com/openapi/v3/maps.js?ncpKeyId=4ybsftznyl"></script>
+    
+    <link rel="stylesheet" href="style.css">
+</head>
+<body class="bg-gray-900 text-gray-100 font-sans antialiased overflow-hidden">
+
+    <div id="app" class="flex flex-col h-screen w-screen relative">
+        
+        <!-- Top Brand Bar -->
+        <header class="bg-orange-600 text-white px-4 py-3 flex items-center justify-between shadow-md z-30">
+            <div class="flex items-center space-x-2">
+                <i class="fa-solid fa-seedling text-xl"></i>
+                <h1 class="font-bold text-lg tracking-tight">파밭 직거래</h1>
+                <span class="text-xs bg-orange-700 px-2 py-0.5 rounded-full font-medium">상인·농가 산지 맵</span>
+            </div>
+            <div class="flex items-center space-x-2">
+                <div class="relative">
+                    <input type="text" id="search-input" oninput="handleSearch(this.value)" placeholder="등록된 밭 검색..." class="bg-orange-700/80 text-white placeholder-orange-200 text-xs rounded-lg px-3 py-1.5 pl-8 focus:outline-none focus:bg-orange-700 w-32 sm:w-44">
+                    <i class="fa-solid fa-search absolute left-2.5 top-2 text-orange-200 text-xs"></i>
+                </div>
+                <button onclick="alert('알림: [면적재기]로 땅을 잰 후 [내 땅 등록]을 누르거나 바로 [내 땅 등록]을 눌러 정보를 입력하세요!')" class="p-2 hover:bg-orange-700 rounded-lg transition relative"><i class="fa-solid fa-bell"></i><span class="absolute top-1 right-1 w-2 h-2 bg-red-400 rounded-full"></span></button>
+            </div>
+        </header>
+
+        <!-- Main Content Area -->
+        <main class="flex-1 relative overflow-hidden flex flex-col">
+            
+            <!-- Tab 1: Map View -->
+            <div id="tab-map" class="tab-content absolute inset-0 flex flex-col">
+                <!-- Top Action Bar -->
+                <div class="relative bg-gray-800/95 backdrop-blur border-b border-gray-700 px-3 py-2.5 flex items-center space-x-2 z-30">
+                    <button onclick="toggleMeasureMode()" id="measure-btn" class="bg-blue-600 hover:bg-blue-500 text-white px-3.5 py-2 rounded-xl text-xs font-bold shadow flex items-center space-x-1.5 cursor-pointer transition shrink-0">
+                        <i class="fa-solid fa-draw-polygon"></i>
+                        <span id="measure-btn-text">면적재기 시작</span>
+                    </button>
+
+                    <button type="button" id="register-farm-btn" class="bg-emerald-600 hover:bg-emerald-500 text-white px-3.5 py-2 rounded-xl text-xs font-bold shadow flex items-center space-x-1.5 cursor-pointer transition shrink-0">
+                        <i class="fa-solid fa-tractor"></i>
+                        <span>내 땅 등록</span>
+                    </button>
+
+                    <div class="h-4 w-[1px] bg-gray-700 shrink-0"></div>
+
+                    <select id="filter-status" onchange="applyFilters()" class="bg-gray-700 hover:bg-gray-600 text-gray-200 px-3 py-2 rounded-xl text-xs font-medium focus:outline-none cursor-pointer shrink-0">
+                        <option value="전체">전체 거래상태</option>
+                        <option value="판매중">판매중만</option>
+                        <option value="예약중">예약중만</option>
+                    </select>
+                </div>
+
+                <!-- 네이버 지도 렌더링 영역 -->
+                <div id="map-canvas" class="flex-1 relative bg-gray-950 overflow-hidden">
+                    <!-- 네이버 지도가 그려질 영역 (다른 오버레이를 지우지 않도록 별도 div) -->
+                    <div id="naver-map-inner" style="position:absolute; top:0; left:0; width:100%; height:100%;"></div>
+                    
+                    <!-- 우측 상단 소형 툴바 -->
+                    <div class="absolute right-4 top-4 flex space-x-2 z-20">
+                        <button onclick="panToCurrentLocation()" class="bg-gray-800/90 hover:bg-gray-700 border border-gray-700 text-orange-400 px-3 py-2 rounded-xl shadow-lg text-xs font-bold flex items-center space-x-1.5 transition" title="실시간 내 위치">
+                            <i class="fa-solid fa-location-crosshairs"></i><span>내위치</span>
+                        </button>
+                        <button onclick="toggleCadastralLayer()" class="bg-gray-800/90 hover:bg-gray-700 border border-gray-700 text-gray-300 px-3 py-2 rounded-xl shadow-lg text-xs font-bold flex items-center space-x-1.5 transition" title="지적도 토글">
+                            <i class="fa-solid fa-layer-group"></i><span>지적도</span>
+                        </button>
+                    </div>
+
+                    <!-- 📐 하단 측정 안내 패널 -->
+                    <div id="measure-panel" class="hidden absolute bottom-6 left-4 right-4 bg-gray-900/95 backdrop-blur border border-blue-500 text-white p-3 rounded-2xl z-20 shadow-xl flex justify-between items-center">
+                        <div class="flex items-center space-x-2">
+                            <div class="w-2.5 h-2.5 bg-blue-500 rounded-full animate-ping"></div>
+                            <span class="text-xs font-bold text-blue-300" id="measure-guide-text">밭 모서리를 차례대로 터치하세요 (0개 점)</span>
+                        </div>
+                        <div class="flex space-x-1">
+                            <button onclick="undoLastPoint()" class="bg-gray-800 hover:bg-gray-700 px-2.5 py-1.5 rounded-lg text-[11px] font-bold text-gray-200">이전점 취소</button>
+                            <button onclick="resetMeasurePoints()" class="bg-gray-800 hover:bg-gray-700 px-2.5 py-1.5 rounded-lg text-[11px] font-bold text-gray-200">초기화</button>
+                        </div>
+                    </div>
+
+
+                </div>
+            </div>
+
+            <!-- Tab 2: Saved & Notes -->
+            <div id="tab-saved" class="tab-content hidden absolute inset-0 p-4 overflow-y-auto bg-gray-900">
+                <h2 class="text-xl font-bold mb-4 flex items-center"><i class="fa-solid fa-heart text-red-500 mr-2"></i> 관심 밭 & 임장 메모</h2>
+                <p class="text-xs text-gray-400 mb-4">현장 방문(임장) 시 진입로 상태, 상차 용이성 등을 메모해 두세요.</p>
+                <div id="saved-list-container" class="space-y-3"></div>
+            </div>
+
+            <!-- Tab 3: Activity & Safe Contact -->
+            <div id="tab-activity" class="tab-content hidden absolute inset-0 p-4 overflow-y-auto bg-gray-900">
+                <div class="max-w-xl mx-auto space-y-4">
+                    <div class="bg-gray-800 border border-gray-700 rounded-2xl p-5 shadow-lg flex items-center justify-between">
+                        <div class="flex items-center space-x-3">
+                            <div class="w-12 h-12 bg-orange-600/20 text-orange-400 rounded-2xl flex items-center justify-center text-xl"><i class="fa-solid fa-user-shield"></i></div>
+                            <div>
+                                <h3 class="font-bold text-sm">안심번호 보안 시스템 가동 중</h3>
+                                <p class="text-xs text-gray-400">개인정보 노출 없이 가상 번호로 안전하게 통화하세요.</p>
+                            </div>
+                        </div>
+                        <span class="bg-green-500/20 text-green-400 text-xs px-2.5 py-1 rounded-full font-medium">보안 활성</span>
+                    </div>
+
+                    <div class="bg-gray-800 border border-gray-700 rounded-2xl p-5 shadow-lg">
+                        <h3 class="font-bold text-sm mb-3 text-gray-200"><i class="fa-solid fa-phone-volume mr-2 text-orange-400"></i>최근 연락 및 문의 로그</h3>
+                        <div id="inquiry-log-list" class="space-y-3"></div>
+                    </div>
+                </div>
+            </div>
+
+        </main>
+
+        <!-- Bottom Navigation Bar -->
+        <nav class="bg-gray-800/95 backdrop-blur border-t border-gray-700 flex justify-around items-center py-2.5 z-40 shadow-lg">
+            <button onclick="switchTab('map')" class="nav-btn flex flex-col items-center text-orange-500 transition" data-target="map">
+                <i class="fa-solid fa-map text-lg mb-1"></i><span class="text-[11px] font-medium">지도</span>
+            </button>
+            <button onclick="switchTab('saved')" class="nav-btn flex flex-col items-center text-gray-400 hover:text-gray-200 transition" data-target="saved">
+                <i class="fa-solid fa-heart text-lg mb-1"></i><span class="text-[11px] font-medium">찜·임장메모</span>
+            </button>
+            <button onclick="switchTab('activity')" class="nav-btn flex flex-col items-center text-gray-400 hover:text-gray-200 transition" data-target="activity">
+                <i class="fa-solid fa-list-check text-lg mb-1"></i><span class="text-[11px] font-medium">활동·문의</span>
+            </button>
+        </nav>
+
+    </div>
+
+    <!-- ✨ 백드롭 + 모달: 지도 영역 밖(최상위)에 둬서 지도 초기화와 무관하게 유지 -->
+    <div id="modal-backdrop" onclick="closeSheet(event)" class="hidden fixed inset-0 bg-black/70 backdrop-blur-sm z-[99] flex items-end sm:items-center justify-center transition-opacity duration-300">
+        <div id="field-detail-sheet" onclick="event.stopPropagation()" class="w-full sm:max-w-lg bg-gray-900 border border-gray-700 rounded-t-3xl sm:rounded-2xl p-6 shadow-2xl transform translate-y-full transition-transform duration-300 max-h-[90vh] overflow-y-auto">
+            <div class="w-12 h-1.5 bg-gray-600 rounded-full mx-auto mb-4 cursor-pointer sm:hidden" onclick="closeSheet()"></div>
+            <div id="sheet-content"></div>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
