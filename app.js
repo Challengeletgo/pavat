@@ -1,12 +1,62 @@
+/* ==========================================================
+   파밭 직거래 — app.js
+   ========================================================== */
+
+/* ---------- 유틸 ---------- */
+const $ = (id) => document.getElementById(id);
+
+// 사용자가 입력한 글을 innerHTML에 넣을 때 태그로 해석되지 않도록 변환
+const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+));
+
+function loadJSON(key) {
+    try { return JSON.parse(localStorage.getItem(key)) || []; } catch (e) { return []; }
+}
+function persist(key, value) {
+    try { localStorage.setItem(key, JSON.stringify(value)); } catch (e) { console.warn('저장 실패', e); }
+}
+
+let toastTimer = null;
+function showToast(message) {
+    const el = $('toast');
+    if (!el) return;
+    el.textContent = message;
+    el.classList.add('is-show');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => el.classList.remove('is-show'), 2200);
+}
+
+function formatPrice(man) {
+    const n = Number(man);
+    if (!n) return '협의';
+    if (n >= 10000) {
+        const eok = n / 10000;
+        return `${parseFloat(eok.toFixed(2))}억`;
+    }
+    return `${n.toLocaleString()}만`;
+}
+
+function timeAgo(ts) {
+    const s = Math.floor((Date.now() - ts) / 1000);
+    if (s < 60) return '방금 전';
+    if (s < 3600) return `${Math.floor(s / 60)}분 전`;
+    if (s < 86400) return `${Math.floor(s / 3600)}시간 전`;
+    return `${Math.floor(s / 86400)}일 전`;
+}
+
+/* ---------- 상태 ---------- */
 let mapInstance = null;
 let naverMarkers = [];
 let naverPolygons = [];
 let cadastralLayerActive = false;
+let cadastralLayer = null;
+let satelliteActive = false;
 let myLocationMarker = null;
 let watchId = null;
 
-let listings = JSON.parse(localStorage.getItem('farm_listings')) || [];
-let inquiries = JSON.parse(localStorage.getItem('farm_inquiries')) || [];
+let listings = loadJSON('farm_listings');
+let inquiries = loadJSON('farm_inquiries');
 
 let isMeasuring = false;
 let measurePoints = [];
@@ -17,109 +67,112 @@ let calculatedPyeong = 0;
 let lastRegisteredLat = 34.9921;
 let lastRegisteredLng = 126.4783;
 let activePolygonCoords = [];
+let activePolygonIsTemp = false;   // 면적을 재지 않고 등록할 때 true
+let tempCenter = null;
 
+const KIND_COLORS = {
+    mine:     { fill: '#1C5B3A', stroke: '#14452C' },
+    sale:     { fill: '#E8590C', stroke: '#C2410C' },
+    reserved: { fill: '#3B6FD4', stroke: '#2B57B0' }
+};
+const MEASURE_COLOR = '#6D4AE0';
+
+function statusKind(item) { return item.status === '판매중' ? 'sale' : 'reserved'; }
+function pinKind(item) { return item.isMyFarm ? 'mine' : statusKind(item); }
+function statusTags(item) {
+    const mine = item.isMyFarm ? '<span class="tag tag--mine">내 밭</span>' : '';
+    return `${mine}<span class="tag tag--${statusKind(item)}">${esc(item.status)}</span>`;
+}
+
+/* ---------- 탭 ---------- */
 function switchTab(targetTab) {
-    document.querySelectorAll('.tab-content').forEach(el => el.classList.add('hidden'));
-    document.getElementById(`tab-${targetTab}`).classList.remove('hidden');
+    document.querySelectorAll('.tab-content').forEach((el) => el.classList.add('hidden'));
+    $(`tab-${targetTab}`).classList.remove('hidden');
 
-    document.querySelectorAll('.nav-btn').forEach(btn => {
-        if (btn.getAttribute('data-target') === targetTab) {
-            btn.classList.remove('text-gray-400', 'hover:text-gray-200');
-            btn.classList.add('text-orange-500');
-        } else {
-            btn.classList.remove('text-orange-500');
-            btn.classList.add('text-gray-400', 'hover:text-gray-200');
-        }
+    document.querySelectorAll('.nav-btn').forEach((btn) => {
+        const active = btn.getAttribute('data-target') === targetTab;
+        btn.classList.toggle('is-active', active);
+        if (active) btn.setAttribute('aria-current', 'page'); else btn.removeAttribute('aria-current');
     });
 
     if (targetTab === 'saved') renderSavedList();
     if (targetTab === 'activity') renderInquiries();
-    
-    if (targetTab === 'map' && mapInstance && window.naver && window.naver.maps && window.naver.maps.Event) {
-        setTimeout(() => {
-            window.naver.maps.Event.trigger(mapInstance, 'resize');
-        }, 150);
+
+    if (targetTab === 'map' && mapInstance && window.naver && window.naver.maps) {
+        setTimeout(() => window.naver.maps.Event.trigger(mapInstance, 'resize'), 100);
     }
+}
+
+/* ---------- 지도 초기화 ---------- */
+function showMapError() {
+    const el = $('map-error');
+    if (el) el.classList.remove('hidden');
+    const o = $('map-error-origin');
+    if (o) o.textContent = location.origin;
 }
 
 function initMap() {
-    const mapCanvas = document.getElementById('map-canvas');
-    
-    if (window.naver && window.naver.maps && window.naver.maps.Map) {
-        try {
-            const mapOptions = {
-                center: new naver.maps.LatLng(34.9921, 126.4783),
-                zoom: 13,
-                minZoom: 8,
-                styleId: '6e0eb66f-c236-4b13-9b82-170d90c57a2c'
-            };
-            
-            mapInstance = new naver.maps.Map('naver-map-inner', mapOptions);
-            
-            window.naver.maps.Event.addListener(mapInstance, 'click', function(e) {
-                if (!isMeasuring) return;
-                const coord = e.coord;
+    if (window.__mapAuthFailed || !(window.naver && window.naver.maps && window.naver.maps.Map)) {
+        showMapError();
+        return;
+    }
 
-                measurePoints.push(coord);
-                lastRegisteredLat = coord.lat();
-                lastRegisteredLng = coord.lng();
+    try {
+        mapInstance = new naver.maps.Map('naver-map-inner', {
+            center: new naver.maps.LatLng(34.9921, 126.4783),
+            zoom: 13,
+            minZoom: 8,
+            styleId: '6e0eb66f-c236-4b13-9b82-170d90c57a2c'
+        });
 
-                const isFirst = (measurePoints.length === 1);
-                const markerColor = isFirst ? '#ef4444' : '#2563eb';
-                const vertexMarker = new naver.maps.Marker({
-                    position: coord,
-                    map: mapInstance,
-                    icon: {
-                        content: `<div style="background:${markerColor}; width:14px; height:14px; border:2px solid #ffffff; border-radius:50%; box-shadow:0 2px 4px rgba(0,0,0,0.5);"></div>`,
-                        anchor: new naver.maps.Point(7, 7)
-                    }
-                });
+        naver.maps.Event.addListener(mapInstance, 'click', function (e) {
+            if (!isMeasuring) return;
+            const coord = e.coord;
 
-                measureMarkers.push(vertexMarker);
-                updateMeasureShapes();
+            measurePoints.push(coord);
+            lastRegisteredLat = coord.lat();
+            lastRegisteredLng = coord.lng();
 
-                const guideText = document.getElementById('measure-guide-text');
-                const panel = document.getElementById('measure-panel');
-                if (panel) panel.classList.remove('hidden');
-
-                if (measurePoints.length >= 3) {
-                    const areaInfo = calculateSphericalPolygonArea(measurePoints);
-                    calculatedPyeong = areaInfo.pyeong;
-                    if (guideText) guideText.innerText = `총 ${measurePoints.length}개 점 · ${calculatedPyeong} 평 (${areaInfo.sqm} ㎡)`;
-                } else {
-                    if (guideText) guideText.innerText = `모서리 ${measurePoints.length}개 찍힘 (최소 3개 필요)`;
+            const first = measurePoints.length === 1;
+            measureMarkers.push(new naver.maps.Marker({
+                position: coord,
+                map: mapInstance,
+                icon: {
+                    content: `<div class="vtx${first ? ' vtx--first' : ''}"></div>`,
+                    anchor: new naver.maps.Point(0, 0)
                 }
-            });
+            }));
 
-            window.naver.maps.Event.once(mapInstance, 'init', function() {
-                window.naver.maps.Event.trigger(mapInstance, 'resize');
-                startRealtimeLocationTracking();
-            });
+            updateMeasureShapes();
+            refreshMeasureGuide();
+        });
 
-            renderMapEntities(listings);
-        } catch (err) {
-            console.warn("네이버 지도 로드 실패", err);
-        }
+        naver.maps.Event.once(mapInstance, 'init', function () {
+            naver.maps.Event.trigger(mapInstance, 'resize');
+            startRealtimeLocationTracking();
+        });
+
+        applyFilters();
+    } catch (err) {
+        console.warn('네이버 지도 로드 실패', err);
+        showMapError();
     }
 }
 
+/* ---------- 내 위치 ---------- */
 function startRealtimeLocationTracking() {
     if (!navigator.geolocation) return;
 
     navigator.geolocation.getCurrentPosition(
-        (position) => {
-            updateUserLocationOnMap(position.coords.latitude, position.coords.longitude, true);
-        },
-        (error) => { console.log("위치 권한 대기중", error); },
+        (p) => updateUserLocationOnMap(p.coords.latitude, p.coords.longitude, true),
+        (err) => console.log('위치 권한 대기중', err),
         { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
     );
 
     if (watchId !== null) navigator.geolocation.clearWatch(watchId);
     watchId = navigator.geolocation.watchPosition(
-        (position) => {
-            updateUserLocationOnMap(position.coords.latitude, position.coords.longitude, false);
-        },
-        (error) => { console.warn("위치 추적 오류", error); },
+        (p) => updateUserLocationOnMap(p.coords.latitude, p.coords.longitude, false),
+        (err) => console.warn('위치 추적 오류', err),
         { enableHighAccuracy: true, maximumAge: 5000, timeout: 5000 }
     );
 }
@@ -127,89 +180,145 @@ function startRealtimeLocationTracking() {
 function updateUserLocationOnMap(lat, lng, shouldCenter) {
     if (!mapInstance || !window.naver || !window.naver.maps) return;
 
-    const currentLatLng = new naver.maps.LatLng(lat, lng);
+    const here = new naver.maps.LatLng(lat, lng);
     lastRegisteredLat = lat;
     lastRegisteredLng = lng;
 
     if (shouldCenter) {
-        mapInstance.setCenter(currentLatLng);
+        mapInstance.setCenter(here);
         mapInstance.setZoom(15);
     }
 
     if (myLocationMarker) {
-        myLocationMarker.setPosition(currentLatLng);
+        myLocationMarker.setPosition(here);
     } else {
         myLocationMarker = new naver.maps.Marker({
-            position: currentLatLng,
+            position: here,
             map: mapInstance,
-            icon: {
-                content: '<div style="background:#f97316; width:20px; height:20px; border:3px solid #ffffff; border-radius:50%; box-shadow:0 0 12px rgba(249,115,22,0.9); animation: pulse-subtle 2s infinite;"></div>',
-                anchor: new naver.maps.Point(10, 10)
-            }
+            zIndex: 5,
+            icon: { content: '<div class="me"></div>', anchor: new naver.maps.Point(0, 0) }
         });
     }
 }
 
 function panToCurrentLocation() {
     if (!navigator.geolocation) {
-        alert("이 브라우저는 위치 정보를 지원하지 않습니다.");
+        showToast('이 브라우저는 위치 정보를 지원하지 않아요');
         return;
     }
-
     navigator.geolocation.getCurrentPosition(
-        (position) => {
-            updateUserLocationOnMap(position.coords.latitude, position.coords.longitude, true);
-            alert("실시간 내 현장 위치로 이동했습니다.");
+        (p) => {
+            updateUserLocationOnMap(p.coords.latitude, p.coords.longitude, true);
+            showToast('내 위치로 이동했어요');
         },
-        () => { alert("위치 정보를 가져올 수 없습니다. 브라우저 위치 허용을 확인해주세요."); },
+        () => showToast('위치를 가져오지 못했어요. 브라우저의 위치 허용을 확인해 주세요'),
         { enableHighAccuracy: true }
     );
 }
 
+function setFabState(id, on) {
+    const btn = $(id);
+    if (!btn) return;
+    btn.classList.toggle('is-on', on);
+    btn.setAttribute('aria-pressed', String(on));
+}
+
+// 위성지도: 위성 사진 위에 도로·지명을 겹친 '겹쳐보기(HYBRID)'를 씁니다.
+// 사진만 보고 싶으면 아래 HYBRID를 SATELLITE로 바꾸세요.
+function toggleSatellite() {
+    if (!mapInstance || !(window.naver && naver.maps)) {
+        showToast('지도를 불러온 뒤 사용할 수 있어요');
+        return;
+    }
+    satelliteActive = !satelliteActive;
+    mapInstance.setMapTypeId(satelliteActive ? naver.maps.MapTypeId.HYBRID : naver.maps.MapTypeId.NORMAL);
+    setFabState('satellite-btn', satelliteActive);
+    showToast(satelliteActive ? '위성지도로 바꿨어요' : '일반 지도로 돌아왔어요');
+}
+
+// 지적편집도는 '지도 유형'이 아니라 별도 '레이어'라서 CadastralLayer로 켜고 끕니다.
+// (위성지도 위에도 겹쳐 볼 수 있어요)
+function toggleCadastralLayer() {
+    if (!mapInstance || !(window.naver && naver.maps && naver.maps.CadastralLayer)) {
+        showToast('지도를 불러온 뒤 사용할 수 있어요');
+        return;
+    }
+    if (!cadastralLayer) cadastralLayer = new naver.maps.CadastralLayer();
+    cadastralLayerActive = !cadastralLayerActive;
+    cadastralLayer.setMap(cadastralLayerActive ? mapInstance : null);
+    setFabState('cadastral-btn', cadastralLayerActive);
+    showToast(cadastralLayerActive ? '지적편집도를 켰어요' : '지적편집도를 껐어요');
+}
+
+/* ---------- 면적 측정 ---------- */
 function calculateSphericalPolygonArea(points) {
     if (points.length < 3) return { sqm: 0, pyeong: 0 };
     let area = 0;
     const earthRadius = 6378137;
     const rad = Math.PI / 180;
-    
+
     for (let i = 0; i < points.length; i++) {
-        let p1 = points[i];
-        let p2 = points[(i + 1) % points.length];
-        
-        let lat1 = p1.lat() * rad;
-        let lat2 = p2.lat() * rad;
-        let lng1 = p1.lng() * rad;
-        let lng2 = p2.lng() * rad;
-        
+        const p1 = points[i];
+        const p2 = points[(i + 1) % points.length];
+        const lat1 = p1.lat() * rad, lat2 = p2.lat() * rad;
+        const lng1 = p1.lng() * rad, lng2 = p2.lng() * rad;
         area += (lng2 - lng1) * (2 + Math.sin(lat1) + Math.sin(lat2));
     }
     area = area * earthRadius * earthRadius / 2.0;
-    let sqm = Math.abs(area);
-    let pyeong = Math.round(sqm / 3.305785);
-    return { sqm: Math.round(sqm), pyeong: pyeong };
+    const sqm = Math.abs(area);
+    return { sqm: Math.round(sqm), pyeong: Math.round(sqm / 3.305785) };
 }
 
-function toggleMeasureMode() {
-    isMeasuring = !isMeasuring;
-    const btnText = document.getElementById('measure-btn-text');
-    const btn = document.getElementById('measure-btn');
-    const panel = document.getElementById('measure-panel');
+// 지도에서 안 재고 등록할 때, 입력한 평수와 똑같은 크기의 정사각형 구역을 만들어 줍니다
+function makeSquareAround(lat, lng, pyeong) {
+    const sqm = Math.max(Number(pyeong) || 1, 1) * 3.305785;
+    const half = Math.sqrt(sqm) / 2;
+    const dLat = half / 111320;
+    const dLng = half / (111320 * Math.cos(lat * Math.PI / 180));
+    return [
+        { lat: lat + dLat, lng: lng - dLng },
+        { lat: lat + dLat, lng: lng + dLng },
+        { lat: lat - dLat, lng: lng + dLng },
+        { lat: lat - dLat, lng: lng - dLng }
+    ];
+}
 
-    if (isMeasuring) {
-        resetMeasurePoints();
-        if (panel) panel.classList.remove('hidden');
-        if (btn) {
-            btn.classList.remove('bg-blue-600', 'hover:bg-blue-500');
-            btn.classList.add('bg-red-600', 'hover:bg-red-500', 'ring-2', 'ring-red-300');
-        }
-        if (btnText) btnText.innerText = "면적재기 중지";
+function setMeasureMode(on) {
+    isMeasuring = on;
+    const tab = $('tab-map');
+    if (tab) tab.classList.toggle('is-measuring', on);
+    // 측정 중에는 가격 마커를 숨겨서 지도를 깔끔하게 (모서리 터치도 가로막지 않음)
+    naverMarkers.forEach((m) => m.setMap(on ? null : mapInstance));
+}
+
+function startMeasure() {
+    resetMeasurePoints();
+    setMeasureMode(true);
+    refreshMeasureGuide();
+}
+
+function cancelMeasure() {
+    resetMeasurePoints();
+    setMeasureMode(false);
+}
+
+function refreshMeasureGuide() {
+    const main = $('measure-area-main');
+    const sub = $('measure-guide-text');
+    const cta = $('measure-register-btn');
+    const n = measurePoints.length;
+
+    if (n >= 3) {
+        const info = calculateSphericalPolygonArea(measurePoints);
+        calculatedPyeong = info.pyeong;
+        if (main) main.textContent = `${info.pyeong.toLocaleString()}평`;
+        if (sub) sub.textContent = `${info.sqm.toLocaleString()}㎡ · 모서리 ${n}개`;
+        if (cta) cta.disabled = false;
     } else {
-        if (panel) panel.classList.add('hidden');
-        if (btn) {
-            btn.classList.remove('bg-red-600', 'hover:bg-red-500', 'ring-2', 'ring-red-300');
-            btn.classList.add('bg-blue-600', 'hover:bg-blue-500');
-        }
-        if (btnText) btnText.innerText = "면적재기 시작";
+        calculatedPyeong = 0;
+        if (main) main.textContent = '면적 재는 중';
+        if (sub) sub.textContent = `모서리를 터치하세요 (${n}/3)`;
+        if (cta) cta.disabled = true;
     }
 }
 
@@ -217,26 +326,20 @@ function updateMeasureShapes() {
     if (!window.naver || !window.naver.maps) return;
     if (currentPolyline) currentPolyline.setMap(null);
     if (currentPolygon) currentPolygon.setMap(null);
+    currentPolyline = null;
+    currentPolygon = null;
 
     if (measurePoints.length >= 2) {
         currentPolyline = new naver.maps.Polyline({
-            map: mapInstance,
-            path: measurePoints,
-            strokeColor: '#2563eb',
-            strokeWeight: 3,
-            strokeOpacity: 0.8
+            map: mapInstance, path: measurePoints,
+            strokeColor: MEASURE_COLOR, strokeWeight: 3, strokeOpacity: 0.9
         });
     }
-
     if (measurePoints.length >= 3) {
         currentPolygon = new naver.maps.Polygon({
-            map: mapInstance,
-            paths: [measurePoints],
-            fillColor: '#3b82f6',
-            fillOpacity: 0.35,
-            strokeColor: '#2563eb',
-            strokeWeight: 3,
-            strokeOpacity: 0.9
+            map: mapInstance, paths: [measurePoints],
+            fillColor: MEASURE_COLOR, fillOpacity: 0.28,
+            strokeColor: MEASURE_COLOR, strokeWeight: 3, strokeOpacity: 0.95
         });
     }
 }
@@ -244,465 +347,445 @@ function updateMeasureShapes() {
 function undoLastPoint() {
     if (measurePoints.length === 0) return;
     measurePoints.pop();
-    const lastMarker = measureMarkers.pop();
-    if (lastMarker) lastMarker.setMap(null);
-
+    const last = measureMarkers.pop();
+    if (last) last.setMap(null);
     updateMeasureShapes();
-
-    const guideText = document.getElementById('measure-guide-text');
-    if (measurePoints.length >= 3) {
-        const areaInfo = calculateSphericalPolygonArea(measurePoints);
-        calculatedPyeong = areaInfo.pyeong;
-        if (guideText) guideText.innerText = `총 ${measurePoints.length}개 점 · ${calculatedPyeong} 평`;
-    } else {
-        if (guideText) guideText.innerText = `모서리 ${measurePoints.length}개 찍힘 (최소 3개 필요)`;
-    }
+    refreshMeasureGuide();
 }
 
 function resetMeasurePoints() {
     measurePoints = [];
     calculatedPyeong = 0;
-    measureMarkers.forEach(m => m.setMap(null));
+    measureMarkers.forEach((m) => m.setMap(null));
     measureMarkers = [];
     if (currentPolyline) currentPolyline.setMap(null);
     if (currentPolygon) currentPolygon.setMap(null);
-
-    const panel = document.getElementById('measure-panel');
-    if (panel) panel.classList.add('hidden');
+    currentPolyline = null;
+    currentPolygon = null;
+    refreshMeasureGuide();
 }
 
-// ✨ [내 땅 등록] 버튼 클릭 시 어두운 백드롭과 함께 모달 창 오픈
+/* ---------- 바텀시트 ---------- */
+let sheetTimer = null;
+
+function openSheet(html) {
+    const backdrop = $('modal-backdrop');
+    const sheet = $('field-detail-sheet');
+    const content = $('sheet-content');
+    if (!backdrop || !sheet || !content) return;
+
+    clearTimeout(sheetTimer);
+    content.innerHTML = html;
+    backdrop.classList.remove('hidden');
+    requestAnimationFrame(() => requestAnimationFrame(() => sheet.classList.add('is-open')));
+}
+
+function closeSheet() {
+    const backdrop = $('modal-backdrop');
+    const sheet = $('field-detail-sheet');
+    if (!backdrop || !sheet || backdrop.classList.contains('hidden')) return;
+
+    sheet.classList.remove('is-open');
+    clearTimeout(sheetTimer);
+    sheetTimer = setTimeout(() => backdrop.classList.add('hidden'), 280);
+}
+
+/* ---------- 내 땅 등록 ---------- */
 function openRegisterSheetFromMeasurement() {
-    // 지도에서 잰 면적(3점 이상)이 있으면 그 값을 우선 사용
-    const measuredInfo = measurePoints.length >= 3 ? calculateSphericalPolygonArea(measurePoints) : null;
-    const finalPyeong = measuredInfo ? measuredInfo.pyeong : (calculatedPyeong || 500);
-    const areaBanner = measuredInfo
-        ? `<div class="mb-3 bg-blue-500/10 border border-blue-500/40 text-blue-300 text-[11px] rounded-xl px-3 py-2"><i class="fa-solid fa-ruler-combined mr-1"></i>지도에서 잰 면적이 자동 입력되었습니다: <b>${measuredInfo.pyeong}평</b> (${measuredInfo.sqm}㎡)</div>`
-        : `<div class="mb-3 bg-gray-800 border border-gray-700 text-gray-400 text-[11px] rounded-xl px-3 py-2"><i class="fa-solid fa-circle-info mr-1"></i>면적을 재지 않아 임시 구역으로 등록됩니다. 면적은 직접 수정할 수 있어요.</div>`;
-    
-    if (measurePoints.length >= 3) {
-        activePolygonCoords = measurePoints.map(pt => ({ lat: pt.lat(), lng: pt.lng() }));
+    const measured = measurePoints.length >= 3 ? calculateSphericalPolygonArea(measurePoints) : null;
+
+    if (measured) {
+        activePolygonIsTemp = false;
+        activePolygonCoords = measurePoints.map((pt) => ({ lat: pt.lat(), lng: pt.lng() }));
     } else {
+        // 면적을 재지 않은 경우: 지도 중앙을 기준으로 등록 (구역은 입력한 평수 크기로 만들어짐)
+        activePolygonIsTemp = true;
         if (mapInstance) {
-            const center = mapInstance.getCenter();
-            lastRegisteredLat = center.lat();
-            lastRegisteredLng = center.lng();
+            const c = mapInstance.getCenter();
+            lastRegisteredLat = c.lat();
+            lastRegisteredLng = c.lng();
         }
-        activePolygonCoords = [
-            { lat: lastRegisteredLat + 0.001, lng: lastRegisteredLng - 0.001 },
-            { lat: lastRegisteredLat + 0.001, lng: lastRegisteredLng + 0.001 },
-            { lat: lastRegisteredLat - 0.001, lng: lastRegisteredLng + 0.001 },
-            { lat: lastRegisteredLat - 0.001, lng: lastRegisteredLng - 0.001 }
-        ];
+        tempCenter = { lat: lastRegisteredLat, lng: lastRegisteredLng };
+        activePolygonCoords = makeSquareAround(tempCenter.lat, tempCenter.lng, 500);
     }
 
-    isMeasuring = false;
-    const btnText = document.getElementById('measure-btn-text');
-    const btn = document.getElementById('measure-btn');
-    const panel = document.getElementById('measure-panel');
-    if (panel) panel.classList.add('hidden');
-    if (btn) {
-        btn.classList.remove('bg-red-600', 'ring-2', 'ring-red-300');
-        btn.classList.add('bg-blue-600');
-    }
-    if (btnText) btnText.innerText = "면적재기 시작";
+    const banner = measured
+        ? `<div class="note note--measure"><i class="fa-solid fa-ruler-combined"></i><div>지도에서 잰 면적이 자동 입력됐어요: <b>${measured.pyeong.toLocaleString()}평</b> (${measured.sqm.toLocaleString()}㎡)</div></div>`
+        : `<div class="note note--info"><i class="fa-solid fa-circle-info"></i><div>면적을 재지 않아 지도 가운데에 입력한 평수만큼의 구역으로 표시돼요. 정확한 모양은 <b>면적재기</b>로 직접 그려 보세요.</div></div>`;
 
-    const backdrop = document.getElementById('modal-backdrop');
-    const sheet = document.getElementById('field-detail-sheet');
-    const content = document.getElementById('sheet-content');
-    if (!content || !sheet || !backdrop) return;
-
-    content.innerHTML = `
-        <div class="flex justify-between items-start mb-4">
-            <div>
-                <span class="bg-emerald-500/20 text-emerald-400 text-xs px-2.5 py-1 rounded-md font-bold"><i class="fa-solid fa-tractor mr-1"></i> 내 땅(밭) 정보 등록</span>
-                <h3 class="text-base font-bold mt-1 text-gray-100">대파 재배지 정보를 입력하세요</h3>
+    openSheet(`
+        <div class="sheet__head">
+            <div class="min0">
+                <span class="tag tag--mine"><i class="fa-solid fa-tractor"></i>&nbsp; 내 땅 등록</span>
+                <h3 class="sheet__title">대파 재배지 정보를 입력하세요</h3>
             </div>
-            <button onclick="closeSheet()" class="text-gray-400 hover:text-white p-1 cursor-pointer"><i class="fa-solid fa-xmark text-xl"></i></button>
+            <button type="button" class="icon-btn" onclick="closeSheet()" aria-label="닫기"><i class="fa-solid fa-xmark"></i></button>
         </div>
 
-        ${areaBanner}
-        <form id="inline-farm-form" onsubmit="submitInlineFarm(event)" class="space-y-3.5">
-            <div>
-                <label class="block text-xs font-semibold text-gray-300 mb-1">밭 이름 / 매물 제목</label>
-                <input type="text" id="reg-title" value="[내 밭] 임자면 대파 재배 하우스" class="w-full bg-gray-800 border border-gray-700 rounded-xl px-3 py-2.5 text-xs text-gray-200 focus:outline-none focus:border-orange-500" required>
-            </div>
-            <div class="grid grid-cols-2 gap-2.5">
-                <div>
-                    <label class="block text-xs font-semibold text-gray-300 mb-1">대파 품종</label>
-                    <select id="reg-variety" class="w-full bg-gray-800 border border-gray-700 rounded-xl px-2.5 py-2.5 text-xs text-gray-200 focus:outline-none focus:border-orange-500">
+        ${banner}
+
+        <form id="inline-farm-form" onsubmit="submitInlineFarm(event)">
+            <label class="field">
+                <span class="field__label">밭 이름 · 매물 제목</span>
+                <input type="text" id="reg-title" class="input" placeholder="예: 임자면 월동대파 3번 밭" maxlength="40" required>
+            </label>
+            <div class="field-row">
+                <label class="field">
+                    <span class="field__label">대파 품종</span>
+                    <select id="reg-variety" class="input">
                         <option>월동대파</option>
                         <option>봄대파</option>
                         <option>중생종 대파</option>
                     </select>
-                </div>
-                <div>
-                    <label class="block text-xs font-semibold text-gray-300 mb-1">재배 면적 (평)</label>
-                    <input type="number" id="reg-area" value="${finalPyeong}" class="w-full bg-gray-800 border border-blue-500 rounded-xl px-3 py-2.5 text-xs font-bold text-blue-300 focus:outline-none" required>
-                </div>
+                </label>
+                <label class="field">
+                    <span class="field__label">재배 면적 (평)</span>
+                    <input type="number" id="reg-area" class="input${measured ? ' input--measured' : ''}" inputmode="numeric" min="1"
+                           value="${measured ? measured.pyeong : ''}" placeholder="예: 500" required>
+                </label>
             </div>
-            <div class="grid grid-cols-2 gap-2.5">
-                <div>
-                    <label class="block text-xs font-semibold text-gray-300 mb-1">수확 예정일</label>
-                    <input type="date" id="reg-date" class="w-full bg-gray-800 border border-gray-700 rounded-xl px-2.5 py-2.5 text-xs text-gray-200 focus:outline-none focus:border-orange-500" required>
-                </div>
-                <div>
-                    <label class="block text-xs font-semibold text-gray-300 mb-1">희망 총액 (만원)</label>
-                    <input type="number" id="reg-price" placeholder="예: 850" class="w-full bg-gray-800 border border-gray-700 rounded-xl px-3 py-2.5 text-xs text-gray-200 focus:outline-none focus:border-orange-500" required>
-                </div>
+            <div class="field-row">
+                <label class="field">
+                    <span class="field__label">수확 예정일</span>
+                    <input type="date" id="reg-date" class="input" required>
+                </label>
+                <label class="field">
+                    <span class="field__label">희망 총액 (만원)</span>
+                    <input type="number" id="reg-price" class="input" inputmode="numeric" min="0" placeholder="예: 850" required>
+                </label>
             </div>
-            <div>
-                <label class="block text-xs font-semibold text-gray-300 mb-1">현장 특이사항 메모</label>
-                <textarea id="reg-notes" rows="2" placeholder="예: 5톤 화물차 진입 가능, 지하수 관정 완비" class="w-full bg-gray-800 border border-gray-700 rounded-xl px-3 py-2.5 text-xs text-gray-200 focus:outline-none focus:border-orange-500"></textarea>
-            </div>
-            <button type="submit" class="w-full bg-orange-600 hover:bg-orange-700 text-white font-bold py-3.5 rounded-xl transition shadow-lg flex items-center justify-center space-x-1.5 text-xs cursor-pointer">
-                <i class="fa-solid fa-circle-check"></i><span>내 밭으로 최종 등록 완료하기</span>
-            </button>
+            <label class="field">
+                <span class="field__label">현장 특이사항</span>
+                <textarea id="reg-notes" class="input" rows="2" maxlength="120" placeholder="예: 5톤 화물차 진입 가능, 지하수 관정 완비"></textarea>
+            </label>
+            <button type="submit" class="btn btn--primary btn--block"><i class="fa-solid fa-circle-check"></i><span>내 밭으로 등록하기</span></button>
         </form>
-    `;
-
-    backdrop.classList.remove('hidden');
-    setTimeout(() => {
-        sheet.classList.remove('translate-y-full');
-    }, 10);
-}
-
-function closeSheet(e) {
-    const sheet = document.getElementById('field-detail-sheet');
-    const backdrop = document.getElementById('modal-backdrop');
-    if (sheet && backdrop) {
-        sheet.classList.add('translate-y-full');
-        setTimeout(() => {
-            backdrop.classList.add('hidden');
-        }, 300);
-    }
+    `);
 }
 
 function submitInlineFarm(e) {
     e.preventDefault();
-    const title = document.getElementById('reg-title').value;
-    const variety = document.getElementById('reg-variety').value;
-    const area = Number(document.getElementById('reg-area').value);
-    const harvestDate = document.getElementById('reg-date').value;
-    const price = Number(document.getElementById('reg-price').value);
-    const notes = document.getElementById('reg-notes').value;
+    const title = $('reg-title').value.trim();
+    const variety = $('reg-variety').value;
+    const area = Number($('reg-area').value);
+    const harvestDate = $('reg-date').value;
+    const price = Number($('reg-price').value);
+    const notes = $('reg-notes').value.trim();
 
-    if (!activePolygonCoords || activePolygonCoords.length < 3) {
-        if (mapInstance) {
-            const center = mapInstance.getCenter();
-            lastRegisteredLat = center.lat();
-            lastRegisteredLng = center.lng();
-        }
-        activePolygonCoords = [
-            { lat: lastRegisteredLat + 0.001, lng: lastRegisteredLng - 0.001 },
-            { lat: lastRegisteredLat + 0.001, lng: lastRegisteredLng + 0.001 },
-            { lat: lastRegisteredLat - 0.001, lng: lastRegisteredLng + 0.001 },
-            { lat: lastRegisteredLat - 0.001, lng: lastRegisteredLng - 0.001 }
-        ];
+    if (!title || !(area > 0)) {
+        showToast('밭 이름과 면적을 확인해 주세요');
+        return;
+    }
+
+    // 면적을 안 재고 등록한 경우, 입력한 평수에 맞춰 구역 크기를 다시 만듭니다
+    if (activePolygonIsTemp && tempCenter) {
+        activePolygonCoords = makeSquareAround(tempCenter.lat, tempCenter.lng, area);
     }
 
     let sumLat = 0, sumLng = 0;
-    activePolygonCoords.forEach(pt => {
-        sumLat += pt.lat;
-        sumLng += pt.lng;
-    });
+    activePolygonCoords.forEach((pt) => { sumLat += pt.lat; sumLng += pt.lng; });
     const centerLat = sumLat / activePolygonCoords.length;
     const centerLng = sumLng / activePolygonCoords.length;
 
-    const newListing = {
+    listings.push({
         id: Date.now(),
-        title: title,
-        variety: variety,
-        area: area,
-        harvestDate: harvestDate,
-        price: price,
-        unitPrice: `${(price / area).toFixed(2)}만/평`,
+        title, variety, area, harvestDate, price,
+        unitPrice: price > 0 ? `${(price / area).toFixed(2)}만/평` : '협의',
         expectedYield: `약 ${(area * 0.018).toFixed(1)}톤`,
-        status: "판매중",
-        farmer: "나 (소유주)",
-        safePhone: "0505-7777-8888",
-        notes: notes || "특이사항 없음",
+        status: '판매중',
+        farmer: '나 (소유주)',
+        safePhone: '0505-7777-8888',
+        notes: notes || '특이사항 없음',
         lat: centerLat,
         lng: centerLng,
         polygonCoords: [...activePolygonCoords],
         isSaved: false,
         isMyFarm: true,
-        visitNote: ""
-    };
+        visitNote: ''
+    });
+    persist('farm_listings', listings);
 
-    listings.push(newListing);
-    localStorage.setItem('farm_listings', JSON.stringify(listings));
-
-    alert("✨ 성공적으로 내 밭 정보가 등록되어 지도에 영구 저장되었습니다!");
-    closeSheet();
     resetMeasurePoints();
+    setMeasureMode(false);
     activePolygonCoords = [];
-    renderMapEntities(listings);
+    closeSheet();
+
+    // 필터/검색 때문에 새 밭이 안 보이는 일이 없도록 초기화
+    const search = $('search-input');
+    if (search) search.value = '';
+    setStatusFilter('전체');
+
+    if (mapInstance && window.naver && window.naver.maps) {
+        mapInstance.panTo(new naver.maps.LatLng(centerLat, centerLng));
+    }
+    showToast('내 밭을 등록했어요');
 }
 
+/* ---------- 지도 위 밭 표시 ---------- */
 function renderMapEntities(targetListings) {
     if (!mapInstance || !window.naver || !window.naver.maps) return;
-    
-    naverMarkers.forEach(m => m.setMap(null));
+
+    naverMarkers.forEach((m) => m.setMap(null));
     naverMarkers = [];
-    naverPolygons.forEach(p => p.setMap(null));
+    naverPolygons.forEach((p) => p.setMap(null));
     naverPolygons = [];
 
-    targetListings.forEach(item => {
-        const position = new naver.maps.LatLng(item.lat, item.lng);
-        
-        let statusColor = item.isMyFarm 
-            ? 'bg-emerald-600 border-emerald-400' 
-            : (item.status === '판매중' ? 'bg-orange-600 border-orange-400' : 'bg-blue-600 border-blue-400');
-        
-        let badge = item.isMyFarm ? '<span class="bg-white text-emerald-700 text-[9px] px-1.5 py-0.2 rounded font-extrabold mr-1">내 밭</span>' : '<i class="fa-solid fa-seedling text-[10px]"></i>';
+    targetListings.forEach((item) => {
+        const kind = pinKind(item);
+        const colors = KIND_COLORS[kind];
 
-        const contentString = `
-            <div class="marker-bubble cursor-pointer ${statusColor} text-white px-3 py-1.5 rounded-xl shadow-2xl border text-xs font-bold flex items-center space-x-1">
-                ${badge}
-                <span>${item.price}만원</span>
-                <span class="text-[10px] opacity-80 font-normal">(${item.area}평)</span>
-            </div>
-        `;
+        const content = `
+            <div class="pin pin--${kind}">
+                ${item.isMyFarm ? '<span class="pin__tag">내 밭</span>' : ''}
+                <span>${formatPrice(item.price)}</span>
+                <span class="pin__area">${Number(item.area).toLocaleString()}평</span>
+            </div>`;
 
         const marker = new naver.maps.Marker({
-            position: position,
-            map: mapInstance,
-            icon: {
-                content: contentString,
-                size: new naver.maps.Size(130, 45),
-                anchor: new naver.maps.Point(65, 22)
-            }
+            position: new naver.maps.LatLng(item.lat, item.lng),
+            map: isMeasuring ? null : mapInstance,
+            icon: { content, anchor: new naver.maps.Point(0, 0) }
         });
-
-        window.naver.maps.Event.addListener(marker, 'click', () => {
+        naver.maps.Event.addListener(marker, 'click', () => {
+            if (isMeasuring) return;
             openFieldDetail(item.id);
         });
         naverMarkers.push(marker);
 
         if (item.polygonCoords && item.polygonCoords.length >= 3) {
-            const paths = item.polygonCoords.map(coord => new naver.maps.LatLng(coord.lat, coord.lng));
-            const polygon = new naver.maps.Polygon({
+            naverPolygons.push(new naver.maps.Polygon({
                 map: mapInstance,
-                paths: paths,
-                fillColor: item.isMyFarm ? '#10b981' : (item.status === '판매중' ? '#f97316' : '#3b82f6'),
-                fillOpacity: 0.38,
-                strokeColor: item.isMyFarm ? '#059669' : (item.status === '판매중' ? '#ea580c' : '#2563eb'),
-                strokeWeight: item.isMyFarm ? 3.5 : 3,
+                paths: item.polygonCoords.map((c) => new naver.maps.LatLng(c.lat, c.lng)),
+                fillColor: colors.fill,
+                fillOpacity: 0.3,
+                strokeColor: colors.stroke,
+                strokeWeight: 2.5,
                 strokeOpacity: 0.95
-            });
-            naverPolygons.push(polygon);
+            }));
         }
     });
 }
 
-function applyFilters() {
-    const status = document.getElementById('filter-status').value;
-
-    const filtered = listings.filter(item => {
-        const matchStatus = (status === '전체' || item.status === status);
-        return matchStatus;
+/* ---------- 필터 · 검색 ---------- */
+function setStatusFilter(value) {
+    const input = $('filter-status');
+    if (input) input.value = value;
+    document.querySelectorAll('.chip').forEach((c) => {
+        c.setAttribute('aria-pressed', String(c.dataset.value === value));
     });
+    applyFilters();
+}
 
+function applyFilters() {
+    const status = ($('filter-status') || {}).value || '전체';
+    const searchEl = $('search-input');
+    const q = searchEl ? searchEl.value.toLowerCase().trim() : '';
+
+    const filtered = listings.filter((item) => {
+        const okStatus = status === '전체'
+            || (status === '내 밭' ? item.isMyFarm : item.status === status);
+        const okSearch = !q
+            || String(item.title).toLowerCase().includes(q)
+            || String(item.variety).toLowerCase().includes(q)
+            || String(item.notes).toLowerCase().includes(q);
+        return okStatus && okSearch;
+    });
     renderMapEntities(filtered);
 }
 
-function handleSearch(keyword) {
-    const query = keyword.toLowerCase().trim();
-    if (!query) {
-        renderMapEntities(listings);
-        return;
-    }
-    const searched = listings.filter(item => 
-        item.title.toLowerCase().includes(query) || 
-        item.variety.toLowerCase().includes(query) || 
-        item.notes.toLowerCase().includes(query)
-    );
-
-    renderMapEntities(searched);
-}
-
-function toggleCadastralLayer() {
-    cadastralLayerActive = !cadastralLayerActive;
-    if (mapInstance && window.naver && window.naver.maps) {
-        mapInstance.setMapTypeId(cadastralLayerActive ? naver.maps.MapTypeId.CADASTRAL : naver.maps.MapTypeId.NORMAL);
-    }
-    alert(cadastralLayerActive ? "지적편집도 레이어가 활성화되었습니다." : "일반 지도 레이어로 전환되었습니다.");
-}
-
+/* ---------- 밭 상세 ---------- */
 function openFieldDetail(id) {
-    const item = listings.find(l => l.id === id);
+    const item = listings.find((l) => l.id === id);
     if (!item) return;
 
-    const backdrop = document.getElementById('modal-backdrop');
-    const sheet = document.getElementById('field-detail-sheet');
-    const content = document.getElementById('sheet-content');
-
-    if (!content || !backdrop || !sheet) return;
-
-    let myFarmBadge = item.isMyFarm ? '<span class="bg-emerald-500/20 text-emerald-400 text-xs px-2 py-0.5 rounded-md font-bold mr-1">내 밭 관리중</span>' : '';
-
-    content.innerHTML = `
-        <div class="flex justify-between items-start mb-3">
-            <div>
-                <div class="flex items-center space-x-1 mb-1">
-                    ${myFarmBadge}
-                    <span class="bg-orange-500/20 text-orange-400 text-xs px-2 py-0.5 rounded-md font-semibold">${item.variety}</span>
-                </div>
-                <h3 class="text-lg font-bold text-gray-100">${item.title}</h3>
+    openSheet(`
+        <div class="sheet__head">
+            <div class="min0">
+                <div class="tags">${statusTags(item)}<span class="tag">${esc(item.variety)}</span></div>
+                <h3 class="sheet__title">${esc(item.title)}</h3>
             </div>
-            <button onclick="closeSheet()" class="text-gray-400 hover:text-white p-1 cursor-pointer"><i class="fa-solid fa-xmark text-xl"></i></button>
+            <button type="button" class="icon-btn" onclick="closeSheet()" aria-label="닫기"><i class="fa-solid fa-xmark"></i></button>
         </div>
 
-        <div class="grid grid-cols-3 gap-2 bg-gray-800 p-3 rounded-xl mb-4 text-center">
-            <div>
-                <div class="text-[11px] text-gray-400">재배 면적</div>
-                <div class="text-sm font-bold text-gray-200">${item.area}평</div>
-            </div>
-            <div>
-                <div class="text-[11px] text-gray-400">예상 수확량</div>
-                <div class="text-sm font-bold text-orange-400">${item.expectedYield}</div>
-            </div>
-            <div>
-                <div class="text-[11px] text-gray-400">평당 단가</div>
-                <div class="text-sm font-bold text-gray-200">${item.unitPrice}</div>
-            </div>
+        <div class="stats">
+            <div class="stat"><div class="stat__label">재배 면적</div><div class="stat__value">${Number(item.area).toLocaleString()}평</div></div>
+            <div class="stat"><div class="stat__label">예상 수확량</div><div class="stat__value stat__value--accent">${esc(item.expectedYield)}</div></div>
+            <div class="stat"><div class="stat__label">평당 단가</div><div class="stat__value">${esc(item.unitPrice)}</div></div>
         </div>
 
-        <div class="space-y-2 text-xs text-gray-300 mb-4 bg-gray-800/50 p-3 rounded-xl border border-gray-700/50">
-            <div class="flex justify-between"><span>수확 예정일:</span><strong class="text-white">${item.harvestDate}</strong></div>
-            <div class="flex justify-between"><span>등록자/농가:</span><strong class="text-white">${item.farmer}</strong></div>
-            <div class="flex justify-between"><span>특이사항:</span><span class="text-right text-gray-400">${item.notes}</span></div>
+        <div class="kv">
+            <div class="kv__row"><span class="kv__k">희망 총액</span><span class="kv__v">${item.price ? Number(item.price).toLocaleString() + '만원' : '협의'}</span></div>
+            <div class="kv__row"><span class="kv__k">수확 예정일</span><span class="kv__v">${esc(item.harvestDate)}</span></div>
+            <div class="kv__row"><span class="kv__k">등록자</span><span class="kv__v">${esc(item.farmer)}</span></div>
+            <div class="kv__row"><span class="kv__k">안심번호</span><span class="kv__v">${esc(item.safePhone)}</span></div>
+            <div class="kv__row"><span class="kv__k">특이사항</span><span class="kv__v kv__v--soft">${esc(item.notes)}</span></div>
         </div>
 
-        <div class="flex space-x-2">
-            <button onclick="toggleSave(${item.id})" class="flex-1 bg-gray-800 hover:bg-gray-700 border border-gray-700 py-3 rounded-xl font-bold text-xs flex items-center justify-center space-x-2 transition cursor-pointer">
-                <i class="fa-solid fa-heart ${item.isSaved ? 'text-red-500' : 'text-gray-400'}"></i>
-                <span>${item.isSaved ? '찜 완료됨' : '관심 밭 찜'}</span>
+        <div class="actions">
+            <button type="button" class="btn btn--ghost btn--icon" onclick="toggleSave(${item.id})" aria-pressed="${!!item.isSaved}" aria-label="${item.isSaved ? '관심 밭 해제' : '관심 밭에 담기'}">
+                <i class="fa-solid fa-heart ${item.isSaved ? 'heart-on' : ''}" style="${item.isSaved ? '' : 'color: var(--ink-3)'}"></i>
             </button>
-            <button onclick="callSafeNumber('${item.safePhone}', '${item.title}')" class="flex-[2] bg-orange-600 hover:bg-orange-700 text-white py-3 rounded-xl font-bold text-xs flex items-center justify-center space-x-2 shadow-lg transition cursor-pointer">
-                <i class="fa-solid fa-phone"></i>
-                <span>안심번호 연결 (${item.safePhone})</span>
+            <button type="button" class="btn btn--primary" onclick="callSafeNumber(${item.id})">
+                <i class="fa-solid fa-phone"></i><span>안심번호로 통화</span>
             </button>
         </div>
-    `;
+        ${item.isMyFarm ? `
+        <div class="delete-row">
+            <button type="button" class="btn btn--danger-soft btn--block" onclick="confirmDeleteFarm(${item.id})">
+                <i class="fa-solid fa-trash-can"></i><span>내 밭 삭제</span>
+            </button>
+        </div>` : ''}
+    `);
+}
 
-    backdrop.classList.remove('hidden');
-    setTimeout(() => {
-        sheet.classList.remove('translate-y-full');
-    }, 10);
+/* ---------- 내 밭 삭제 ---------- */
+function confirmDeleteFarm(id) {
+    const item = listings.find((l) => l.id === id);
+    if (!item || !item.isMyFarm) return;   // 내가 등록한 밭만 삭제 가능
+
+    openSheet(`
+        <div class="confirm">
+            <div class="confirm__icon"><i class="fa-solid fa-trash-can"></i></div>
+            <h3 class="sheet__title">내 밭을 삭제할까요?</h3>
+            <p class="confirm__desc"><b>${esc(item.title)}</b><br>지도의 구역과 입력한 정보가 모두 사라지고, 되돌릴 수 없어요.</p>
+            <div class="actions">
+                <button type="button" class="btn btn--ghost" onclick="openFieldDetail(${id})">취소</button>
+                <button type="button" class="btn btn--danger" onclick="deleteFarm(${id})">삭제하기</button>
+            </div>
+        </div>
+    `);
+}
+
+function deleteFarm(id) {
+    const item = listings.find((l) => l.id === id);
+    if (!item || !item.isMyFarm) return;
+
+    listings = listings.filter((l) => l.id !== id);
+    persist('farm_listings', listings);
+
+    closeSheet();
+    applyFilters();                       // 지도의 마커·구역 다시 그리기
+    if (!$('tab-saved').classList.contains('hidden')) renderSavedList();
+    showToast('내 밭을 삭제했어요');
 }
 
 function toggleSave(id) {
-    const item = listings.find(l => l.id === id);
-    if (item) {
-        item.isSaved = !item.isSaved;
-        localStorage.setItem('farm_listings', JSON.stringify(listings));
-        openFieldDetail(id);
-    }
+    const item = listings.find((l) => l.id === id);
+    if (!item) return;
+    item.isSaved = !item.isSaved;
+    persist('farm_listings', listings);
+    openFieldDetail(id);
+    showToast(item.isSaved ? '관심 밭에 담았어요' : '관심 밭에서 뺐어요');
 }
 
-function callSafeNumber(phone, title) {
-    alert(`[안심번호 보안 연결]\n안전한 통화를 위해 안심번호(${phone})로 연결을 시도합니다.\n(대상 밭: ${title})`);
+function callSafeNumber(id) {
+    const item = listings.find((l) => l.id === id);
+    if (!item) return;
     inquiries.unshift({
         id: Date.now(),
-        title: title,
-        merchant: "본인 (산지 상인)",
-        time: "방금 전",
-        status: "안심번호 통화 연결됨"
+        at: Date.now(),
+        title: item.title,
+        merchant: '본인 (산지 상인)',
+        status: '안심번호 통화 연결'
     });
-    localStorage.setItem('farm_inquiries', JSON.stringify(inquiries));
+    persist('farm_inquiries', inquiries);
+    showToast(`안심번호 ${item.safePhone}로 연결해요`);
 }
 
-function renderSavedList() {
-    const container = document.getElementById('saved-list-container');
-    if (!container) return;
-    const savedItems = listings.filter(l => l.isSaved);
+// 관심 밭 목록에서 '지도에서 보기'
+function focusField(id) {
+    const item = listings.find((l) => l.id === id);
+    if (!item) return;
+    switchTab('map');
+    if (mapInstance && window.naver && window.naver.maps) {
+        mapInstance.setCenter(new naver.maps.LatLng(item.lat, item.lng));
+        mapInstance.setZoom(16);
+    }
+    openFieldDetail(id);
+}
 
-    if (savedItems.length === 0) {
+/* ---------- 관심 밭 · 활동 탭 ---------- */
+function renderSavedList() {
+    const container = $('saved-list-container');
+    if (!container) return;
+    const saved = listings.filter((l) => l.isSaved);
+
+    if (saved.length === 0) {
         container.innerHTML = `
-            <div class="text-center py-12 text-gray-500">
-                <i class="fa-solid fa-heart-crack text-3xl mb-2"></i>
-                <p class="text-sm">찜한 대파 밭이 없습니다.<br>지도에서 마음에 드는 밭을 찜해보세요!</p>
-            </div>
-        `;
+            <div class="empty">
+                <i class="fa-regular fa-heart"></i>
+                관심 밭이 아직 없어요.<br>지도에서 마음에 드는 밭을 눌러 담아 보세요.
+            </div>`;
         return;
     }
 
-    container.innerHTML = savedItems.map(item => `
-        <div class="bg-gray-800 border border-gray-700 rounded-xl p-4 space-y-3 shadow">
-            <div class="flex justify-between items-center">
-                <div>
-                    <span class="text-[10px] bg-orange-500/20 text-orange-400 px-2 py-0.5 rounded">${item.variety}</span>
-                    <h4 class="font-bold text-sm mt-1 text-gray-200">${item.title}</h4>
-                    <p class="text-xs text-gray-400 mt-1">면적: ${item.area}평 | 가격: ${item.price}만원 (${item.unitPrice})</p>
+    container.innerHTML = saved.map((item) => `
+        <article class="card">
+            <div class="card__top">
+                <div class="min0">
+                    <div class="tags">${statusTags(item)}<span class="tag">${esc(item.variety)}</span></div>
+                    <h3 class="card__title">${esc(item.title)}</h3>
+                    <p class="card__meta">${Number(item.area).toLocaleString()}평 · ${formatPrice(item.price)} (${esc(item.unitPrice)})</p>
                 </div>
-                <button onclick="openFieldDetail(${item.id})" class="bg-gray-700 hover:bg-gray-600 px-3 py-2 rounded-lg text-xs font-bold text-gray-200 transition cursor-pointer">
-                    지도보기
-                </button>
+                <button type="button" class="btn btn--soft btn--sm" onclick="focusField(${item.id})">지도에서 보기</button>
             </div>
-            <div class="border-t border-gray-700/60 pt-2">
-                <label class="block text-[11px] font-semibold text-orange-400 mb-1"><i class="fa-solid fa-pen-to-square mr-1"></i> 현장 임장 메모</label>
-                <div class="flex space-x-2">
-                    <input type="text" id="note-input-${item.id}" value="${item.visitNote || ''}" placeholder="예: 5톤 진입 가능, 흙 상태 좋음" class="flex-1 bg-gray-900 border border-gray-700 rounded-lg px-3 py-1.5 text-xs text-gray-200 focus:outline-none focus:border-orange-500">
-                    <button onclick="saveVisitNote(${item.id})" class="bg-orange-600 hover:bg-orange-700 text-white px-3 py-1.5 rounded-lg text-xs font-bold transition cursor-pointer">저장</button>
-                </div>
+            <label class="field__label" for="note-input-${item.id}"><i class="fa-solid fa-pen-to-square"></i>&nbsp; 임장 메모</label>
+            <div class="memo">
+                <input type="text" id="note-input-${item.id}" class="input" value="${esc(item.visitNote)}" placeholder="예: 5톤 진입 가능, 흙 상태 좋음">
+                <button type="button" class="btn btn--primary btn--sm" onclick="saveVisitNote(${item.id})">저장</button>
             </div>
-        </div>
+        </article>
     `).join('');
 }
 
 function saveVisitNote(id) {
-    const inputEl = document.getElementById(`note-input-${id}`);
-    const inputVal = inputEl ? inputEl.value : '';
-    const item = listings.find(l => l.id === id);
-    if (item) {
-        item.visitNote = inputVal;
-        localStorage.setItem('farm_listings', JSON.stringify(listings));
-        alert("임장 메모가 성공적으로 저장되었습니다.");
-    }
+    const input = $(`note-input-${id}`);
+    const item = listings.find((l) => l.id === id);
+    if (!item) return;
+    item.visitNote = input ? input.value : '';
+    persist('farm_listings', listings);
+    showToast('임장 메모를 저장했어요');
 }
 
 function renderInquiries() {
-    const container = document.getElementById('inquiry-log-list');
+    const container = $('inquiry-log-list');
     if (!container) return;
-    container.innerHTML = inquiries.map(inq => `
-        <div class="bg-gray-900 border border-gray-700/60 p-3 rounded-xl flex justify-between items-center">
-            <div>
-                <div class="font-bold text-xs text-gray-200">${inq.title}</div>
-                <div class="text-[11px] text-gray-400 mt-0.5">상인: ${inq.merchant} · ${inq.time}</div>
+
+    if (inquiries.length === 0) {
+        container.innerHTML = `
+            <div class="empty">
+                <i class="fa-solid fa-phone-slash"></i>
+                아직 통화 기록이 없어요.<br>밭 상세에서 안심번호로 통화하면 여기에 쌓여요.
+            </div>`;
+        return;
+    }
+
+    container.innerHTML = inquiries.map((inq) => `
+        <div class="log">
+            <div class="min0">
+                <strong>${esc(inq.title)}</strong>
+                <span>${esc(inq.merchant)} · ${inq.at ? timeAgo(inq.at) : esc(inq.time)}</span>
             </div>
-            <span class="text-[10px] bg-green-500/20 text-green-400 px-2 py-1 rounded-md font-medium">${inq.status}</span>
+            <span class="pill">${esc(inq.status)}</span>
         </div>
     `).join('');
 }
 
-// 앱 초기화
-window.addEventListener('load', function() {
-    initMap();
+/* ---------- 시작 ---------- */
+window.addEventListener('load', initMap);
+
+document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') closeSheet();
 });
 
-// '내 땅 등록' 버튼 이벤트를 명시적으로 연결합니다.
 (function bindRegisterFarmButton() {
-    const registerButton = document.getElementById('register-farm-btn');
-
-    if (!registerButton) {
+    const btn = $('register-farm-btn');
+    if (!btn) {
         console.error("[파밭 직거래] '내 땅 등록' 버튼을 찾지 못했습니다. index.html의 id를 확인하세요.");
         return;
     }
-
-    registerButton.addEventListener('click', function(event) {
+    btn.addEventListener('click', (event) => {
         event.preventDefault();
-        console.info("[파밭 직거래] '내 땅 등록' 버튼 클릭 감지");
-
-        try {
-            if (typeof openRegisterSheetFromMeasurement !== 'function') {
-                throw new Error('등록 창을 여는 함수(openRegisterSheetFromMeasurement)를 찾을 수 없습니다.');
-            }
-            openRegisterSheetFromMeasurement();
-        } catch (error) {
-            console.error("[파밭 직거래] 등록 창을 여는 중 오류가 발생했습니다:", error);
-            alert('등록 창을 여는 중 문제가 발생했습니다. F12 → Console에서 오류를 확인해주세요.');
-        }
+        openRegisterSheetFromMeasurement();
     });
 })();
